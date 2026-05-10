@@ -66,7 +66,7 @@ Struktur folder sama, tapi di `./Double_Perovskite_Research/`.
 
 ## Ringkasan Fix
 
-Kode ini memperbaiki 10 masalah dari versi sebelumnya:
+Kode ini memperbaiki 14 masalah dari versi-versi sebelumnya:
 
 ### Fix Leakage
 
@@ -101,6 +101,23 @@ Kode ini memperbaiki 10 masalah dari versi sebelumnya:
 - **[J]** Fitness cache aktif. Elite yang di-copy antar generasi tidak
   dievaluasi ulang. Seed evaluasi deterministik dari hash kromosom.
 
+### Fix v2 (Performance & Robustness)
+
+- **[K]** `n_estimators` dipisah antara **fitness eval** (250, CV cepat)
+  dan **final model** (1000, akurasi maksimal). Untuk 25,000 fit ops
+  di CV, ini menghemat waktu **3–4x** tanpa kehilangan kualitas seleksi.
+- **[L]** Seed dari hash kromosom dijamin `% 2**32` (safe untuk numpy
+  seed yang butuh uint32).
+- **[M]** Checkpoint validasi `n_features`. Kalau dataset berubah
+  antar run, checkpoint dengan shape berbeda otomatis di-discard
+  (mencegah `ValueError: shape mismatch` yang tidak jelas).
+- **[N]** Safety net 3-tier di final model:
+  1. GPU + early stopping
+  2. CPU + early stopping
+  3. CPU plain (no early stop)
+  Kalau ketiga-tiganya gagal, raise RuntimeError yang jelas (bukan
+  crash di tengah jalan).
+
 ## Output
 
 Untuk tiap target, script menyimpan:
@@ -129,6 +146,21 @@ lanjut dari generasi terakhir.
 
 Checkpoint divalidasi terhadap `crossover_rate`, `mutation_rate`,
 dan `pop_size`. Kalau parameter berubah, checkpoint di-discard.
+
+## Catatan tentang Wilcoxon Test
+
+Script melakukan uji Wilcoxon antara CV scores GA vs baseline. Dengan
+`n_folds=5`, ini hanya menghasilkan **5 paired observations** — statistical
+power-nya sangat rendah dan hasil akan hampir selalu `ns` (not significant).
+
+**Untuk TA/publikasi ilmiah**, pertimbangkan:
+- Gunakan **repeated stratified K-fold** (misal 5×5 = 25 observations)
+  dengan `RepeatedStratifiedKFold` dari sklearn.
+- Atau gunakan **nested CV** dengan outer loop sebagai unit observasi.
+- Atau laporkan effect size (Cohen's d) selain p-value.
+
+Untuk TA yang sudah cukup rigor tanpa perlu klaim statistik kuat,
+melaporkan `Delta_CV` (selisih mean) dan boxplot sudah cukup.
 
 ## Referensi
 

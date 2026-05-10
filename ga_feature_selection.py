@@ -122,12 +122,13 @@ lgb_version  = tuple(int(x) for x in lgb.__version__.split('.')[:2])
 GOSS_NEW_API = lgb_version >= (4, 0)
 
 print("=" * 65)
-print("  GA FEATURE SELECTION — FINAL FIXED")
+print("  GA FEATURE SELECTION — FINAL FIXED v2")
 print("  Model  : LightGBM")
 print("  GA     : Elitist Generational (build sendiri)")
 print("  Select : Roulette Wheel (shift + epsilon)")
 print("  CR=0.8 | MR=1/n_features | Elite=2 | EarlyStop=20")
 print("  Leakage-free: imputasi per-fold + SMOTE post-split")
+print("  Speed  : n_est_fitness=250 (CV), n_est_final=1000")
 print("=" * 65)
 
 
@@ -232,6 +233,14 @@ GA_PARAMS = {
     'ckpt_interval'  : 5,
     'n_jobs_parallel': -1,
     'use_fitness_cache': True,  # [FIX-J]
+    # [FIX-K] n_estimators untuk fitness eval (CV) — kecil untuk kecepatan.
+    # Untuk 50 krom x 5 fold x 100 gen = 25,000 fit ops,
+    # 1000 est terlalu mahal. 250 est + early stop 20 cukup.
+    # Final model tetap pakai 1000 est + early stop 100.
+    'n_est_fitness'  : 250,
+    'n_est_final'    : 1000,
+    'early_stop_fit' : 20,      # stopping rounds untuk CV fitness
+    'early_stop_final': 100,    # stopping rounds untuk model final
 }
 
 BG_COLOR    = '#0D1117'
@@ -334,7 +343,13 @@ def load_tuned_params(target_name, method):
         return DEFAULT_PARAMS.copy(), False
 
 
-def build_lgb_params(tuned_params, task_type, device='cpu', n_jobs=1):
+def build_lgb_params(tuned_params, task_type, device='cpu', n_jobs=1,
+                     n_estimators=1000):
+    """
+    [FIX-K] n_estimators bisa di-override.
+      - Fitness eval (CV): pakai nilai kecil (200-300) untuk kecepatan
+      - Model final      : pakai 1000 + early stopping
+    """
     top_rate   = float(tuned_params.get('top_rate',   0.05))
     other_rate = float(tuned_params.get('other_rate', 0.05))
     if top_rate + other_rate >= 1.0:
@@ -348,7 +363,7 @@ def build_lgb_params(tuned_params, task_type, device='cpu', n_jobs=1):
         'colsample_bytree' : float(tuned_params.get('colsample_bytree', 0.8)),
         'reg_alpha'        : float(tuned_params.get('reg_alpha', 0.1)),
         'reg_lambda'       : float(tuned_params.get('reg_lambda', 0.1)),
-        'n_estimators'     : 1000,   # + early stopping
+        'n_estimators'     : int(n_estimators),
         'n_jobs'           : n_jobs,
         'random_state'     : GLOBAL_SEED,
         'verbose'          : -1,
@@ -528,7 +543,10 @@ def _evaluate_one_chromosome(chromosome, X_arr, y_arr,
                 X_tr, y_tr,
                 eval_set=[(X_val, y_val)],
                 callbacks=[
-                    lgb.early_stopping(stopping_rounds=50, verbose=False),
+                    lgb.early_stopping(
+                        stopping_rounds=GA_PARAMS['early_stop_fit'],
+                        verbose=False,
+                    ),
                     lgb.log_evaluation(period=-1),
                 ]
             )
@@ -579,8 +597,12 @@ class FitnessCache:
 
     @staticmethod
     def seed_from_chrom(chrom, base_seed):
-        # Seed deterministik dari 4 byte pertama hash kromosom
-        return int(base_seed + int.from_bytes(chrom.tobytes()[:4], 'little') % 100000)
+        """
+        Seed deterministik dari hash kromosom.
+        [FIX-L] Modulo 2**32 untuk safety — numpy seed harus <= uint32 max.
+        """
+        h = int.from_bytes(chrom.tobytes()[:4], 'little')
+        return int((base_seed + h) % (2**32))
 
     def get(self, chrom):
         return self.cache.get(self.key(chrom))
@@ -764,8 +786,32 @@ def _all_ckpt_dirs(save_dir):
 
 
 def _validate_ckpt(ckpt, n_features):
+    """
+    [FIX-M] Validasi n_features untuk mencegah shape mismatch.
+    Kalau dataset berubah antar run, kromosom dengan panjang berbeda
+    akan crash saat di-restore. Diskualifikasi checkpoint lebih baik
+    daripada error tidak jelas.
+    """
     errors = []
     expected_mr = compute_mutation_rate(n_features)
+
+    # Validasi n_features dulu — paling fatal kalau tidak cocok
+    ckpt_n_feat = ckpt.get('n_features')
+    if ckpt_n_feat is not None and int(ckpt_n_feat) != int(n_features):
+        errors.append(
+            f"n_features: ckpt={ckpt_n_feat} != current={n_features} "
+            f"(shape mismatch, tidak bisa restore)"
+        )
+        return errors  # fatal, return lebih awal
+
+    # Cek panjang kromosom di checkpoint (fallback kalau n_features tidak ada)
+    ckpt_best = ckpt.get('best_chromosome', [])
+    if ckpt_best and len(ckpt_best) != n_features:
+        errors.append(
+            f"chromosome length: ckpt={len(ckpt_best)} != current={n_features}"
+        )
+        return errors
+
     for key, cfg_val in [
         ('crossover_rate', GA_PARAMS['crossover_rate']),
         ('mutation_rate',  expected_mr),
@@ -864,6 +910,10 @@ def run_ga(X_arr, y_arr, task_type, feature_names,
     print(f"         Pop={pop_size}  Gen={n_generations}  "
           f"CR={crossover_rate}  MR={mutation_rate:.5f} (=1/L)")
     print(f"         Elite={elite_size}  EarlyStop={early_stop_gen}")
+    print(f"         n_est fit={GA_PARAMS['n_est_fitness']} "
+          f"(stop={GA_PARAMS['early_stop_fit']}) | "
+          f"final={GA_PARAMS['n_est_final']} "
+          f"(stop={GA_PARAMS['early_stop_final']})")
     print(f"         SMOTE      : {'Ya (in-fold)' if use_smote else 'Tidak'}")
     print(f"         n_jobs     : {n_jobs} (backend=loky)")
     print(f"         Cache      : {'AKTIF' if use_cache else 'MATI'}")
@@ -961,6 +1011,7 @@ def run_ga(X_arr, y_arr, task_type, feature_names,
                 'crossover_rate' : crossover_rate,
                 'mutation_rate'  : mutation_rate,
                 'pop_size'       : pop_size,
+                'n_features'     : n_features,         # [FIX-M]
                 'last_gen'       : gen + 1,
                 'best_fitness'   : best_fitness,
                 'no_improve_cnt' : no_improve_cnt,
@@ -981,6 +1032,7 @@ def run_ga(X_arr, y_arr, task_type, feature_names,
                 'crossover_rate' : crossover_rate,
                 'mutation_rate'  : mutation_rate,
                 'pop_size'       : pop_size,
+                'n_features'     : n_features,         # [FIX-M]
                 'last_gen'       : gen + 1,
                 'best_fitness'   : best_fitness,
                 'no_improve_cnt' : no_improve_cnt,
@@ -1104,50 +1156,63 @@ def train_final_model(X_train_df, X_test_df, y_train, y_test,
                 print(f"         SMOTE gagal ({e}) -- lanjut tanpa")
 
     # Build params untuk model final (GPU + n_jobs=-1)
+    # [FIX-K] n_est_final = 1000 (vs fitness yang 250)
     final_params = build_lgb_params(
         tuned_params, task_type,
         device=LGB_DEVICE_FINAL, n_jobs=-1,
+        n_estimators=GA_PARAMS['n_est_final'],
     )
-    final_params['n_estimators'] = 1000
 
-    if task_type == 'classification':
-        model = lgb.LGBMClassifier(**final_params)
-    else:
-        model = lgb.LGBMRegressor(**final_params)
+    def _make_model(params):
+        if task_type == 'classification':
+            return lgb.LGBMClassifier(**params)
+        return lgb.LGBMRegressor(**params)
 
-    fit_ok = False
-    if use_early_stopping and X_val_fit is not None:
+    def _fit_with_early_stop(model, params):
+        model.fit(
+            X_tr_fit, y_tr_fit,
+            eval_set=[(X_val_fit, y_val_fit)],
+            callbacks=[
+                lgb.early_stopping(
+                    stopping_rounds=GA_PARAMS['early_stop_final'],
+                    verbose=False,
+                ),
+                lgb.log_evaluation(period=-1),
+            ],
+        )
+        return model
+
+    def _fit_plain(model):
+        model.fit(X_tr_fit, y_tr_fit)
+        return model
+
+    # [FIX-N] Safety net berlapis:
+    # Tier 1: GPU + early stop
+    # Tier 2: CPU + early stop
+    # Tier 3: CPU + no early stop (last resort)
+    model = None
+    for tier, (device, use_es) in enumerate([
+        (LGB_DEVICE_FINAL, True),
+        ('cpu', True),
+        ('cpu', False),
+    ], start=1):
         try:
-            model.fit(
-                X_tr_fit, y_tr_fit,
-                eval_set=[(X_val_fit, y_val_fit)],
-                callbacks=[
-                    lgb.early_stopping(stopping_rounds=100, verbose=False),
-                    lgb.log_evaluation(period=-1),
-                ],
-            )
-            fit_ok = True
-        except Exception as e:
-            print(f"         GPU/early-stop error ({e}) -> fallback CPU")
+            attempt_params = dict(final_params)
+            attempt_params['device'] = device
+            m = _make_model(attempt_params)
 
-    if not fit_ok:
-        # Fallback: CPU + tanpa early stopping (aman)
-        final_params['device'] = 'cpu'
-        model = (lgb.LGBMClassifier(**final_params)
-                 if task_type == 'classification'
-                 else lgb.LGBMRegressor(**final_params))
-        if use_early_stopping and X_val_fit is not None:
-            model.fit(
-                X_tr_fit, y_tr_fit,
-                eval_set=[(X_val_fit, y_val_fit)],
-                callbacks=[
-                    lgb.early_stopping(stopping_rounds=100, verbose=False),
-                    lgb.log_evaluation(period=-1),
-                ],
-            )
-        else:
-            # [FIX-I] benar-benar tanpa eval_set
-            model.fit(X_tr_fit, y_tr_fit)
+            if use_es and use_early_stopping and X_val_fit is not None:
+                model = _fit_with_early_stop(m, attempt_params)
+            else:
+                model = _fit_plain(m)
+            break
+        except Exception as e:
+            print(f"         Tier-{tier} fit gagal "
+                  f"(device={device}, es={use_es}): {e}")
+            if tier == 3:
+                raise RuntimeError(
+                    f"Semua tier fit gagal untuk {task_type}"
+                ) from e
 
     y_pred = model.predict(X_te)
 
@@ -1166,7 +1231,7 @@ def train_final_model(X_train_df, X_test_df, y_train, y_test,
                  if hasattr(model, 'best_iteration_')
                     and model.best_iteration_ is not None
                     and model.best_iteration_ > 0
-                 else 1000)
+                 else GA_PARAMS['n_est_final'])
 
     return model, metrics, best_iter, y_pred, y_te, y_prob_pos
 
@@ -1402,7 +1467,9 @@ for target_name, cfg in TARGET_CONFIG.items():
 
         lgb_params_fitness = build_lgb_params(
             tuned_params, cfg['type'],
-            device=LGB_DEVICE_FITNESS, n_jobs=1)
+            device=LGB_DEVICE_FITNESS, n_jobs=1,
+            n_estimators=GA_PARAMS['n_est_fitness'],  # [FIX-K] kecil untuk CV
+        )
 
         print(f"\n         [2] Load data split 90:10...")
         X_train, X_test, y_train, y_test = load_split_data(target_folder, METHOD)
@@ -1538,6 +1605,10 @@ for target_name, cfg in TARGET_CONFIG.items():
             {'parameter': 'fix_fold_err_H',     'value': 'fold error score=-1e3'},
             {'parameter': 'fix_eval_I',         'value': 'no early-stop kalau split gagal'},
             {'parameter': 'fix_cache_J',        'value': 'fitness cache aktif'},
+            {'parameter': 'fix_seed_K',         'value': f'n_est_fitness={GA_PARAMS["n_est_fitness"]}, n_est_final={GA_PARAMS["n_est_final"]}'},
+            {'parameter': 'fix_seed_L',         'value': 'seed modulo 2**32 (safe numpy seed)'},
+            {'parameter': 'fix_ckpt_M',         'value': 'validasi n_features di checkpoint'},
+            {'parameter': 'fix_fit_tier_N',     'value': 'safety net 3-tier di final model'},
         ]).to_csv(os.path.join(save_dir, 'ga_params_config.csv'), index=False)
 
         row = {
@@ -1690,4 +1761,8 @@ print(f"  [FIX-G] early_stop = 20 generasi")
 print(f"  [FIX-H] Fold error score = -1e3 (bukan 0)")
 print(f"  [FIX-I] No early-stop kalau split val gagal")
 print(f"  [FIX-J] Fitness cache aktif")
+print(f"  [FIX-K] n_est_fitness=250, n_est_final=1000 (kecepatan CV)")
+print(f"  [FIX-L] seed modulo 2**32 (safe numpy seed)")
+print(f"  [FIX-M] Checkpoint validasi n_features (prevent shape mismatch)")
+print(f"  [FIX-N] Safety net 3-tier di final model (GPU->CPU+ES->CPU plain)")
 print(f"{'='*65}")
